@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 944px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>CPU profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(59);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,18883,3,'all')
+f(1,2,160,3,'[not_walkable_Java]')
+f(2,2,160,3,'[unknown]')
+f(3,31,127,3,'__GI___clock_gettime')
+f(4,44,112,3,'[vdso]')
+f(1,219,17417,1,'java/lang/Thread.run')
+f(2,234,9113,1,'kafka/network/Processor.run')
+f(3,262,8502,1,'kafka/network/Processor.poll',11,0,0)
+f(4,273,8491,1,'org/apache/kafka/common/network/Selector.poll')
+f(5,283,219,1,'org/apache/kafka/common/metrics/Sensor.record',19,0,0)
+f(6,301,200,1,'org/apache/kafka/common/metrics/Sensor.recordInternal')
+f(7,401,77,1,'org/apache/kafka/common/metrics/stats/Meter.record')
+f(8,412,66,2,'org/apache/kafka/common/metrics/stats/Rate.record',53,0,0)
+f(9,412,66,2,'org/apache/kafka/common/metrics/stats/SampledStat.record',53,0,0)
+f(5,513,6542,1,'org/apache/kafka/common/network/Selector.pollSelectionKeys')
+f(6,636,4425,1,'org/apache/kafka/common/network/Selector.attemptRead',45,0,0)
+f(7,650,4303,1,'org/apache/kafka/common/network/KafkaChannel.read',35,0,0)
+f(8,653,4294,1,'org/apache/kafka/common/network/KafkaChannel.receive',32,0,0)
+f(9,653,4294,1,'org/apache/kafka/common/network/NetworkReceive.readFrom',32,0,0)
+f(10,657,4290,1,'org/apache/kafka/common/network/PlaintextTransportLayer.read',28,0,0)
+f(11,657,4290,1,'sun/nio/ch/SocketChannelImpl.read',28,0,0)
+f(12,659,1167,4,'OptoRuntime::new_array_C(Klass*, int, JavaThread*)')
+f(13,661,1165,4,'TypeArrayKlass::allocate_common(int, bool, JavaThread*)')
+f(14,662,1163,4,'MemAllocator::allocate() const')
+f(15,665,83,4,'G1CollectedHeap::mem_allocate(unsigned long, bool*)')
+f(16,666,80,4,'G1CollectedHeap::attempt_allocation_humongous(unsigned long)')
+f(17,669,67,4,'G1CollectedHeap::humongous_obj_allocate(unsigned long)')
+f(15,749,1075,3,'__memset_avx2_erms')
+f(16,1709,108,5,'asm_common_interrupt')
+f(17,1709,106,5,'common_interrupt')
+f(18,1709,106,5,'irq_exit_rcu')
+f(19,1709,106,5,'do_softirq_own_stack')
+f(20,1709,106,5,'asm_call_sysvec_on_stack')
+f(21,1709,106,5,'__softirqentry_text_start')
+f(22,1737,77,5,'net_rx_action')
+f(23,1740,74,5,'napi_poll')
+f(24,1740,74,5,'ena_io_poll?[ena]')
+f(25,1768,46,5,'napi_complete_done')
+f(26,1769,45,5,'netif_receive_skb_list_internal')
+f(27,1769,45,5,'__netif_receive_skb_list')
+f(28,1769,45,5,'__netif_receive_skb_list_core')
+f(29,1770,44,5,'ip_list_rcv')
+f(30,1771,43,5,'ip_list_rcv_finish.constprop.0')
+f(31,1773,41,5,'ip_sublist_rcv_finish')
+f(32,1773,41,5,'ip_local_deliver_finish')
+f(33,1773,41,5,'ip_protocol_deliver_rcu')
+f(34,1773,41,5,'tcp_v4_rcv')
+f(35,1774,40,5,'tcp_v4_do_rcv')
+f(36,1774,40,5,'tcp_rcv_established')
+f(12,1840,3107,1,'sun/nio/ch/IOUtil.read',22,0,0)
+f(13,1862,3085,1,'sun/nio/ch/IOUtil.read')
+f(14,1880,449,3,'jbyte_disjoint_arraycopy')
+f(15,2254,72,5,'asm_common_interrupt')
+f(16,2254,72,5,'common_interrupt')
+f(17,2254,72,5,'irq_exit_rcu')
+f(18,2254,72,5,'do_softirq_own_stack')
+f(19,2254,72,5,'asm_call_sysvec_on_stack')
+f(20,2254,72,5,'__softirqentry_text_start')
+f(21,2275,51,5,'net_rx_action')
+f(22,2275,51,5,'napi_poll')
+f(23,2275,51,5,'ena_io_poll?[ena]')
+f(14,2362,183,3,'jshort_disjoint_arraycopy')
+f(14,2545,2367,1,'sun/nio/ch/IOUtil.readIntoNativeBuffer',21,0,0)
+f(15,2562,2350,1,'sun/nio/ch/SocketDispatcher.read',4,0,0)
+f(16,2562,2350,1,'sun/nio/ch/SocketDispatcher.read0',4,0,0)
+f(17,2588,2318,3,'__read')
+f(18,2679,2226,5,'entry_SYSCALL_64_after_hwframe')
+f(19,2679,2210,5,'do_syscall_64')
+f(20,2689,2166,5,'ksys_read')
+f(21,2720,2135,5,'vfs_read')
+f(22,2731,2109,5,'new_sync_read')
+f(23,2748,2092,5,'sock_read_iter')
+f(24,2755,2078,5,'inet6_recvmsg')
+f(25,2759,2074,5,'tcp_recvmsg')
+f(26,2779,241,5,'__kfree_skb')
+f(27,2810,202,5,'skb_release_data')
+f(28,2864,148,5,'free_unref_page')
+f(26,3054,269,5,'__tcp_transmit_skb')
+f(27,3064,250,5,'__ip_queue_xmit')
+f(28,3091,217,5,'ip_finish_output2')
+f(29,3098,193,5,'__dev_queue_xmit')
+f(30,3103,173,5,'__dev_xmit_skb')
+f(31,3135,133,5,'__qdisc_run')
+f(32,3157,111,5,'sch_direct_xmit')
+f(33,3162,90,5,'dev_hard_start_xmit')
+f(34,3163,89,5,'xmit_one.constprop.0')
+f(35,3195,57,5,'ena_start_xmit?[ena]')
+f(26,3350,1459,5,'skb_copy_datagram_iter')
+f(27,3354,1455,5,'__skb_datagram_iter')
+f(28,3382,1316,5,'_copy_to_iter')
+f(29,3410,1285,5,'copy_user_enhanced_fast_string')
+f(30,4536,158,5,'asm_common_interrupt')
+f(31,4536,158,5,'common_interrupt')
+f(32,4536,158,5,'irq_exit_rcu')
+f(33,4536,158,5,'do_softirq_own_stack')
+f(34,4536,158,5,'asm_call_sysvec_on_stack')
+f(35,4536,158,5,'__softirqentry_text_start')
+f(36,4576,117,5,'net_rx_action')
+f(37,4576,117,5,'napi_poll')
+f(38,4576,117,5,'ena_io_poll?[ena]')
+f(39,4580,46,5,'ena_clean_rx_irq?[ena]')
+f(39,4634,59,5,'napi_complete_done')
+f(40,4637,56,5,'netif_receive_skb_list_internal')
+f(41,4637,55,5,'__netif_receive_skb_list')
+f(42,4638,54,5,'__netif_receive_skb_list_core')
+f(43,4641,51,5,'ip_list_rcv')
+f(44,4642,50,5,'ip_list_rcv_finish.constprop.0')
+f(45,4644,48,5,'ip_sublist_rcv_finish')
+f(46,4644,48,5,'ip_local_deliver_finish')
+f(47,4644,48,5,'ip_protocol_deliver_rcu')
+f(48,4644,48,5,'tcp_v4_rcv')
+f(49,4652,38,5,'tcp_v4_do_rcv')
+f(50,4653,37,5,'tcp_rcv_established')
+f(28,4705,104,5,'simple_copy_to_iter')
+f(29,4707,100,5,'__check_object_size.part.0')
+f(7,4953,89,1,'org/apache/kafka/common/network/Selector$SelectorMetrics.recordBytesReceived')
+f(8,4988,54,1,'org/apache/kafka/common/metrics/Sensor.record',4,0,0)
+f(9,4992,50,1,'org/apache/kafka/common/metrics/Sensor.recordInternal')
+f(6,5061,1957,1,'org/apache/kafka/common/network/Selector.attemptWrite',0,1,0)
+f(7,5065,1953,1,'org/apache/kafka/common/network/Selector.write',64,0,0)
+f(8,5069,1880,1,'org/apache/kafka/common/network/KafkaChannel.write',57,0,0)
+f(9,5069,1880,1,'org/apache/kafka/common/network/NetworkSend.writeTo',57,0,0)
+f(10,5071,145,1,'org/apache/kafka/common/network/ByteBufferSend.writeTo',9,0,0)
+f(11,5071,145,1,'org/apache/kafka/common/network/PlaintextTransportLayer.write',9,0,0)
+f(12,5071,145,1,'java/nio/channels/SocketChannel.write',9,0,0)
+f(13,5072,144,1,'sun/nio/ch/SocketChannelImpl.write',8,0,0)
+f(14,5078,137,1,'sun/nio/ch/IOUtil.write',1,0,0)
+f(15,5079,136,1,'sun/nio/ch/IOUtil.write')
+f(16,5084,125,1,'sun/nio/ch/SocketDispatcher.writev')
+f(17,5084,125,1,'sun/nio/ch/FileDispatcherImpl.writev0')
+f(18,5089,120,3,'writev')
+f(19,5102,107,5,'entry_SYSCALL_64_after_hwframe')
+f(20,5102,106,5,'do_syscall_64')
+f(21,5105,101,5,'do_writev')
+f(22,5108,98,5,'vfs_writev')
+f(23,5108,97,5,'do_iter_write')
+f(24,5108,97,5,'do_iter_readv_writev')
+f(25,5108,97,5,'sock_write_iter')
+f(26,5109,96,5,'sock_sendmsg')
+f(27,5115,90,5,'tcp_sendmsg')
+f(28,5115,90,5,'tcp_sendmsg_locked')
+f(29,5118,72,5,'__tcp_push_pending_frames')
+f(30,5118,72,5,'tcp_write_xmit')
+f(31,5120,56,5,'__tcp_transmit_skb')
+f(32,5122,48,5,'__ip_queue_xmit')
+f(33,5129,40,5,'ip_finish_output2')
+f(10,5216,1733,1,'org/apache/kafka/common/record/MultiRecordsSend.writeTo',46,0,0)
+f(11,5259,113,1,'org/apache/kafka/common/network/ByteBufferSend.writeTo')
+f(12,5259,113,1,'org/apache/kafka/common/network/PlaintextTransportLayer.write')
+f(13,5259,113,1,'java/nio/channels/SocketChannel.write')
+f(14,5259,113,1,'sun/nio/ch/SocketChannelImpl.write')
+f(15,5259,113,1,'sun/nio/ch/IOUtil.write')
+f(16,5259,113,1,'sun/nio/ch/IOUtil.write',0,0,1)
+f(17,5269,94,1,'sun/nio/ch/SocketDispatcher.writev',1,0,0)
+f(18,5270,93,1,'sun/nio/ch/FileDispatcherImpl.writev0')
+f(19,5270,93,3,'writev')
+f(20,5279,84,5,'entry_SYSCALL_64_after_hwframe')
+f(21,5279,84,5,'do_syscall_64')
+f(22,5279,80,5,'do_writev')
+f(23,5280,79,5,'vfs_writev')
+f(24,5281,75,5,'do_iter_write')
+f(25,5281,74,5,'do_iter_readv_writev')
+f(26,5282,73,5,'sock_write_iter')
+f(27,5283,72,5,'sock_sendmsg')
+f(28,5286,69,5,'tcp_sendmsg')
+f(29,5288,67,5,'tcp_sendmsg_locked')
+f(30,5297,45,5,'__tcp_push_pending_frames')
+f(31,5297,45,5,'tcp_write_xmit')
+f(32,5298,38,5,'__tcp_transmit_skb')
+f(11,5372,1575,1,'org/apache/kafka/common/record/RecordsSend.writeTo',1,0,0)
+f(12,5372,1575,1,'org/apache/kafka/common/record/DefaultRecordsSend.writeTo',1,0,0)
+f(13,5372,1575,1,'org/apache/kafka/common/record/FileRecords.writeTo',1,0,0)
+f(14,5373,1439,1,'org/apache/kafka/common/network/PlaintextTransportLayer.transferFrom')
+f(15,5373,1439,1,'sun/nio/ch/FileChannelImpl.transferTo',12,0,0)
+f(16,5373,67,1,'sun/nio/ch/FileChannelImpl.size')
+f(17,5376,60,1,'sun/nio/ch/FileDispatcherImpl.size',3,0,0)
+f(18,5379,57,1,'sun/nio/ch/FileDispatcherImpl.size0')
+f(19,5379,56,3,'_fxstat')
+f(16,5440,1372,1,'sun/nio/ch/FileChannelImpl.transferToDirectly',12,0,0)
+f(17,5442,1365,1,'sun/nio/ch/FileChannelImpl.transferToDirectlyInternal',10,0,0)
+f(18,5444,1354,1,'sun/nio/ch/FileChannelImpl.transferTo0',1,0,0)
+f(19,5456,1342,3,'sendfile')
+f(20,5509,1276,5,'entry_SYSCALL_64_after_hwframe')
+f(21,5509,1271,5,'do_syscall_64')
+f(22,5512,1258,5,'__x64_sys_sendfile64')
+f(23,5525,1245,5,'do_sendfile')
+f(24,5547,1214,5,'do_splice_direct')
+f(25,5552,1209,5,'splice_direct_to_actor')
+f(26,5564,704,5,'direct_splice_actor')
+f(27,5569,699,5,'generic_splice_sendpage')
+f(28,5575,693,5,'__splice_from_pipe')
+f(29,5584,684,5,'splice_from_pipe_feed')
+f(30,5668,600,5,'pipe_to_sendpage')
+f(31,5690,578,5,'sock_sendpage')
+f(32,5711,557,5,'kernel_sendpage.part.0')
+f(33,5720,548,5,'inet_sendpage')
+f(34,5755,513,5,'tcp_sendpage')
+f(35,5799,385,5,'do_tcp_sendpages')
+f(36,5882,68,5,'__tcp_push_pending_frames')
+f(37,5882,68,5,'tcp_write_xmit')
+f(38,5889,52,5,'__tcp_transmit_skb')
+f(39,5891,48,5,'__ip_queue_xmit')
+f(40,5891,48,5,'ip_finish_output2')
+f(41,5892,45,5,'__dev_queue_xmit')
+f(42,5892,44,5,'__dev_xmit_skb')
+f(43,5894,42,5,'__qdisc_run')
+f(44,5895,41,5,'sch_direct_xmit')
+f(36,5957,52,5,'sk_stream_alloc_skb')
+f(37,5958,50,5,'__alloc_skb')
+f(36,6035,95,5,'tcp_send_mss')
+f(37,6051,79,5,'tcp_current_mss')
+f(38,6070,37,5,'ipv4_mtu')
+f(36,6137,47,5,'tcp_write_xmit')
+f(37,6137,45,5,'__tcp_transmit_skb')
+f(38,6138,43,5,'__ip_queue_xmit')
+f(39,6139,42,5,'ip_finish_output2')
+f(40,6140,41,5,'__dev_queue_xmit')
+f(41,6140,41,5,'__dev_xmit_skb')
+f(42,6141,39,5,'__qdisc_run')
+f(43,6141,39,5,'sch_direct_xmit')
+f(35,6207,58,5,'release_sock')
+f(26,6270,481,5,'generic_file_splice_read')
+f(27,6280,471,5,'xfs_file_read_iter')
+f(28,6295,456,5,'xfs_file_buffered_aio_read')
+f(29,6295,450,5,'generic_file_buffered_read')
+f(30,6351,49,5,'copy_page_to_iter_pipe')
+f(30,6400,131,5,'generic_file_buffered_read_get_pages')
+f(31,6405,126,5,'find_get_pages_contig')
+f(30,6537,205,5,'mark_page_accessed')
+f(31,6559,168,5,'activate_page')
+f(32,6565,162,5,'pagevec_lru_move_fn')
+f(33,6568,151,5,'_raw_spin_unlock_irqrestore')
+f(14,6812,135,1,'sun/nio/ch/FileChannelImpl.size')
+f(15,6819,97,1,'sun/nio/ch/FileDispatcherImpl.size',3,0,0)
+f(16,6821,95,1,'sun/nio/ch/FileDispatcherImpl.size0',1,0,0)
+f(17,6828,88,3,'_fxstat')
+f(18,6851,65,5,'entry_SYSCALL_64_after_hwframe')
+f(19,6851,63,5,'do_syscall_64')
+f(20,6852,50,5,'__do_sys_newfstat')
+f(8,6949,54,1,'org/apache/kafka/common/network/Selector$SelectorMetrics.recordBytesSent',3,0,0)
+f(5,7055,1706,1,'org/apache/kafka/common/network/Selector.select',8,0,0)
+f(6,7061,1700,1,'sun/nio/ch/SelectorImpl.select',2,0,0)
+f(7,7065,1696,1,'sun/nio/ch/SelectorImpl.lockAndDoSelect')
+f(8,7089,1672,1,'sun/nio/ch/EPollSelectorImpl.doSelect',44,0,0)
+f(9,7098,1319,1,'sun/nio/ch/EPoll.wait',3,0,0)
+f(10,7137,1280,3,'epoll_wait')
+f(11,7282,1135,5,'entry_SYSCALL_64_after_hwframe')
+f(12,7282,1104,5,'do_syscall_64')
+f(13,7284,1069,5,'__x64_sys_epoll_wait')
+f(14,7287,1066,5,'do_epoll_wait')
+f(15,7312,1032,5,'ep_poll')
+f(16,7341,130,5,'ep_scan_ready_list.constprop.0')
+f(17,7353,104,5,'ep_send_events_proc')
+f(18,7388,69,5,'ep_item_poll')
+f(19,7403,54,5,'sock_poll')
+f(16,7483,835,5,'schedule_hrtimeout_range_clock')
+f(17,7498,42,5,'_raw_spin_unlock_irqrestore')
+f(17,7582,736,5,'schedule')
+f(18,7583,734,5,'__schedule')
+f(19,7596,721,5,'finish_task_switch')
+f(20,8205,112,5,'asm_common_interrupt')
+f(21,8205,112,5,'common_interrupt')
+f(22,8205,112,5,'irq_exit_rcu')
+f(23,8205,112,5,'do_softirq_own_stack')
+f(24,8205,112,5,'asm_call_sysvec_on_stack')
+f(25,8205,112,5,'__softirqentry_text_start')
+f(26,8220,96,5,'net_rx_action')
+f(27,8221,95,5,'napi_poll')
+f(28,8221,95,5,'ena_io_poll?[ena]')
+f(29,8264,52,5,'napi_complete_done')
+f(30,8265,51,5,'netif_receive_skb_list_internal')
+f(31,8265,50,5,'__netif_receive_skb_list')
+f(32,8265,50,5,'__netif_receive_skb_list_core')
+f(33,8266,49,5,'ip_list_rcv')
+f(34,8266,49,5,'ip_list_rcv_finish.constprop.0')
+f(35,8272,43,5,'ip_sublist_rcv_finish')
+f(36,8272,43,5,'ip_local_deliver_finish')
+f(37,8272,43,5,'ip_protocol_deliver_rcu')
+f(38,8272,43,5,'tcp_v4_rcv')
+f(39,8272,43,5,'tcp_v4_do_rcv')
+f(40,8273,42,5,'tcp_rcv_established')
+f(9,8417,128,1,'sun/nio/ch/EPollSelectorImpl.processEvents')
+f(10,8444,42,1,'sun/nio/ch/EPollSelectorImpl.clearInterrupt',1,0,0)
+f(11,8444,42,1,'sun/nio/ch/EventFD.reset',1,0,0)
+f(12,8444,42,1,'sun/nio/ch/IOUtil.drain',1,0,0)
+f(13,8449,37,3,'__read')
+f(10,8486,59,2,'sun/nio/ch/SelectorImpl.processReadyEvents',47,0,0)
+f(9,8545,151,1,'sun/nio/ch/EPollSelectorImpl.processUpdateQueue')
+f(10,8567,129,1,'sun/nio/ch/EPoll.ctl',1,0,0)
+f(11,8574,121,3,'__GI_epoll_ctl')
+f(12,8604,91,5,'entry_SYSCALL_64_after_hwframe')
+f(13,8604,89,5,'do_syscall_64')
+f(14,8605,73,5,'__x64_sys_epoll_ctl')
+f(15,8609,69,5,'do_epoll_ctl')
+f(3,8764,152,1,'kafka/network/Processor.processCompletedReceives',10,0,0)
+f(4,8764,143,1,'java/util/LinkedHashMap$LinkedValues.forEach',1,0,0)
+f(5,8764,143,1,'kafka/network/Processor$$Lambda$805.0x0000000800fabd38.accept',1,0,0)
+f(6,8765,142,1,'kafka/network/Processor.$anonfun$processCompletedReceives$1')
+f(7,8799,87,1,'kafka/network/RequestChannel$Request.<init>',20,0,0)
+f(8,8831,48,1,'org/apache/kafka/common/requests/RequestContext.parseRequest')
+f(9,8836,43,1,'org/apache/kafka/common/requests/AbstractRequest.parseRequest',3,0,0)
+f(10,8839,40,1,'org/apache/kafka/common/requests/AbstractRequest.doParseRequest')
+f(3,8916,383,1,'kafka/network/Processor.processCompletedSends',4,0,0)
+f(4,8916,382,1,'java/util/ArrayList.forEach',3,0,0)
+f(5,8916,382,1,'kafka/network/Processor$$Lambda$806.0x0000000800fb0258.accept',3,0,0)
+f(6,8919,379,1,'kafka/network/Processor.$anonfun$processCompletedSends$1')
+f(7,8933,360,1,'kafka/network/Processor.updateRequestMetrics',2,0,0)
+f(8,8935,358,1,'kafka/network/RequestChannel$Request.updateRequestMetrics')
+f(9,8968,323,1,'scala/collection/immutable/List.foreach',5,0,0)
+f(10,8968,323,1,'kafka/network/RequestChannel$Request$$Lambda$898.0x0000000800fec6a0.apply',5,0,0)
+f(11,8973,318,1,'kafka/network/RequestChannel$Request.$anonfun$updateRequestMetrics$1$adapted')
+f(12,8974,317,1,'kafka/network/RequestChannel$Request.$anonfun$updateRequestMetrics$1',15,0,0)
+f(13,8983,270,1,'com/yammer/metrics/core/Histogram.update',1,0,0)
+f(14,9024,229,1,'com/yammer/metrics/stats/ExponentiallyDecayingSample.update',17,0,0)
+f(15,9040,212,1,'com/yammer/metrics/stats/ExponentiallyDecayingSample.update')
+f(16,9140,90,1,'java/util/concurrent/ConcurrentSkipListMap.putIfAbsent',6,0,0)
+f(17,9146,84,1,'java/util/concurrent/ConcurrentSkipListMap.doPut')
+f(18,9153,77,2,'java/util/concurrent/ConcurrentSkipListMap.cpr',67,0,0)
+f(3,9299,48,1,'kafka/network/Processor.processNewResponses')
+f(2,9347,8289,1,'kafka/server/KafkaRequestHandler.run',0,0,9)
+f(3,9407,8217,1,'kafka/server/KafkaApis.handle')
+f(4,9413,918,1,'kafka/server/KafkaApis.handleFetchRequest')
+f(5,9450,74,1,'kafka/server/FetchManager.newContext')
+f(6,9483,41,1,'kafka/server/FetchSessionCache.touch')
+f(5,9524,37,1,'kafka/server/IncrementalFetchContext.foreachPartition',1,0,0)
+f(6,9524,37,1,'java/lang/Iterable.forEach',1,0,0)
+f(5,9561,717,1,'kafka/server/ReplicaManager.fetchMessages',10,0,0)
+f(6,9565,233,1,'kafka/server/DelayedOperationPurgatory.tryCompleteElseWatch')
+f(7,9565,224,1,'kafka/server/DelayedOperation.safeTryCompleteOrElse',9,0,0)
+f(8,9570,50,1,'kafka/server/DelayedFetch.tryComplete')
+f(9,9573,47,1,'scala/collection/AbstractIterable.foreach')
+f(10,9573,47,1,'scala/collection/IterableOnceOps.foreach$')
+f(11,9573,47,1,'scala/collection/IterableOnceOps.foreach')
+f(12,9573,45,1,'kafka/server/DelayedFetch$$Lambda$1685.0x00000008011571d8.apply')
+f(13,9573,45,1,'kafka/server/DelayedFetch.$anonfun$tryComplete$1$adapted')
+f(14,9573,45,1,'kafka/server/DelayedFetch.$anonfun$tryComplete$1')
+f(8,9620,168,1,'kafka/server/DelayedOperationPurgatory$$Lambda$1224.0x00000008010a8578.apply$mcV$sp',3,0,0)
+f(9,9620,168,1,'kafka/server/DelayedOperationPurgatory.$anonfun$tryCompleteElseWatch$2',3,0,0)
+f(10,9620,165,1,'scala/collection/AbstractIterable.foreach',1,0,0)
+f(11,9620,165,1,'scala/collection/IterableOnceOps.foreach$',1,0,0)
+f(12,9620,165,1,'scala/collection/IterableOnceOps.foreach',1,0,0)
+f(13,9621,160,1,'kafka/server/DelayedOperationPurgatory$$Lambda$1231.0x00000008010a9d10.apply')
+f(14,9621,160,1,'kafka/server/DelayedOperationPurgatory.$anonfun$tryCompleteElseWatch$3$adapted')
+f(15,9621,160,1,'kafka/server/DelayedOperationPurgatory.$anonfun$tryCompleteElseWatch$3')
+f(16,9621,160,1,'kafka/server/DelayedOperationPurgatory.watchForOperation')
+f(17,9652,123,2,'kafka/server/DelayedOperationPurgatory.$anonfun$watchForOperation$1',55,0,0)
+f(18,9656,119,2,'kafka/utils/Pool.getAndMaybePut',51,0,0)
+f(19,9657,118,2,'kafka/utils/Pool.getAndMaybePut',50,0,0)
+f(20,9707,68,1,'java/util/concurrent/ConcurrentHashMap.computeIfAbsent')
+f(6,9798,76,1,'kafka/server/KafkaApis$$Lambda$1653.0x000000080113a6c0.apply')
+f(7,9798,76,1,'kafka/server/KafkaApis.$anonfun$handleFetchRequest$33$adapted')
+f(8,9798,76,1,'kafka/server/KafkaApis.$anonfun$handleFetchRequest$33')
+f(9,9798,76,1,'kafka/server/KafkaApis.processResponseCallback$1')
+f(6,9874,276,1,'kafka/server/ReplicaManager.readFromLocalLog')
+f(7,9876,274,1,'scala/collection/AbstractIterable.foreach',1,0,0)
+f(8,9876,274,1,'scala/collection/IterableOnceOps.foreach$',1,0,0)
+f(9,9876,274,1,'scala/collection/IterableOnceOps.foreach',1,0,0)
+f(10,9877,268,1,'kafka/server/ReplicaManager$$Lambda$1655.0x000000080113b230.apply')
+f(11,9877,268,1,'kafka/server/ReplicaManager.$anonfun$readFromLocalLog$7')
+f(12,9879,263,1,'kafka/server/ReplicaManager.read$1')
+f(13,9889,173,1,'kafka/cluster/Partition.fetchRecords',31,0,0)
+f(14,9921,141,1,'kafka/cluster/Partition.$anonfun$fetchRecords$2')
+f(15,9921,141,1,'kafka/cluster/Partition.readFromLocalLog$1',39,0,0)
+f(16,9921,141,1,'kafka/cluster/Partition.readRecords',39,0,0)
+f(17,9921,141,1,'kafka/log/UnifiedLog.read',39,0,0)
+f(18,9921,141,1,'kafka/log/LocalLog.read',39,0,0)
+f(19,9921,102,1,'kafka/log/LocalLog.$anonfun$read$2')
+f(20,9940,46,1,'kafka/log/LogSegment.read',1,0,0)
+f(21,9940,46,1,'kafka/log/LogSegment.translateOffset',1,0,0)
+f(22,9942,44,1,'org/apache/kafka/common/record/FileRecords.searchForOffsetWithSize')
+f(20,9986,37,1,'kafka/log/LogSegments.floorSegment',10,0,0)
+f(21,9986,37,1,'kafka/log/LogSegments.floorEntry',10,0,0)
+f(19,10023,39,2,'kafka/server/LogDirFailureChannel.hasOfflineLogDir',39,0,0)
+f(20,10023,39,2,'java/util/concurrent/ConcurrentHashMap.containsKey',39,0,0)
+f(21,10023,39,2,'java/util/concurrent/ConcurrentHashMap.get',39,0,0)
+f(13,10064,39,1,'kafka/server/ReplicaManager.getPartitionOrException')
+f(14,10064,39,2,'kafka/server/ReplicaManager.getPartitionOrError',39,0,0)
+f(15,10064,39,2,'kafka/server/ReplicaManager.getPartition',39,0,0)
+f(16,10065,38,2,'kafka/utils/Pool.get',38,0,0)
+f(17,10065,38,2,'java/util/concurrent/ConcurrentHashMap.get',38,0,0)
+f(6,10150,87,1,'scala/collection/AbstractIterable.foreach',6,0,0)
+f(7,10150,87,1,'scala/collection/IterableOnceOps.foreach$',6,0,0)
+f(8,10150,87,1,'scala/collection/IterableOnceOps.foreach',6,0,0)
+f(9,10155,65,1,'kafka/server/ReplicaManager$$Lambda$1679.0x0000000801155828.apply',1,0,0)
+f(10,10156,64,1,'kafka/server/ReplicaManager.$anonfun$fetchMessages$1')
+f(6,10237,41,1,'scala/collection/mutable/ArrayBuffer.map')
+f(7,10237,41,1,'scala/collection/StrictOptimizedIterableOps.map$')
+f(8,10237,41,1,'scala/collection/StrictOptimizedIterableOps.map')
+f(4,10331,848,1,'kafka/server/KafkaApis.handleOffsetCommitRequest')
+f(5,10335,768,1,'kafka/coordinator/group/GroupCoordinator.handleCommitOffsets')
+f(6,10348,755,1,'kafka/coordinator/group/GroupMetadata.inLock',6,0,0)
+f(7,10351,752,1,'scala/runtime/java8/JFunction0$mcV$sp.apply',3,0,0)
+f(8,10351,752,1,'kafka/coordinator/group/GroupCoordinator$$Lambda$1736.0x0000000801165e10.apply$mcV$sp',3,0,0)
+f(9,10351,752,1,'kafka/coordinator/group/GroupCoordinator.$anonfun$doCommitOffsets$1',3,0,0)
+f(10,10351,53,1,'kafka/coordinator/group/GroupCoordinator.completeAndScheduleNextHeartbeatExpiration')
+f(11,10351,53,1,'kafka/coordinator/group/GroupCoordinator.completeAndScheduleNextExpiration')
+f(10,10407,696,1,'kafka/coordinator/group/GroupMetadataManager.storeOffsets')
+f(11,10432,578,1,'kafka/server/ReplicaManager.appendRecords')
+f(12,10438,282,1,'kafka/server/DelayedOperationPurgatory.tryCompleteElseWatch')
+f(13,10438,281,1,'kafka/server/DelayedOperation.safeTryCompleteOrElse')
+f(14,10438,281,1,'kafka/server/DelayedProduce.tryComplete')
+f(15,10438,275,1,'kafka/server/DelayedOperation.forceComplete')
+f(16,10441,271,1,'kafka/server/DelayedProduce.onComplete')
+f(17,10445,258,1,'kafka/coordinator/group/GroupMetadataManager$$Lambda$1744.0x0000000801163c00.apply')
+f(18,10447,256,1,'kafka/coordinator/group/GroupMetadataManager.$anonfun$storeOffsets$14$adapted',10,0,0)
+f(19,10447,256,1,'kafka/coordinator/group/GroupMetadataManager.$anonfun$storeOffsets$14',10,0,0)
+f(20,10447,256,1,'kafka/coordinator/group/GroupMetadataManager.putCacheCallback$2',10,0,0)
+f(21,10454,50,1,'kafka/coordinator/group/GroupMetadata.inLock')
+f(22,10454,50,1,'kafka/coordinator/group/GroupMetadataManager$$Lambda$1745.0x000000080116c000.apply')
+f(23,10454,50,1,'kafka/coordinator/group/GroupMetadataManager.$anonfun$storeOffsets$7')
+f(24,10467,37,1,'scala/collection/AbstractMap.foreachEntry')
+f(25,10467,37,1,'scala/collection/MapOps.foreachEntry$',3,0,0)
+f(26,10467,37,1,'scala/collection/MapOps.foreachEntry',3,0,0)
+f(21,10504,187,1,'kafka/server/KafkaApis$$Lambda$1735.0x0000000801165a40.apply',3,0,0)
+f(22,10505,186,1,'kafka/server/KafkaApis.$anonfun$handleOffsetCommitRequest$13$adapted',2,0,0)
+f(23,10505,186,1,'kafka/server/KafkaApis.$anonfun$handleOffsetCommitRequest$13',2,0,0)
+f(24,10505,186,1,'kafka/server/KafkaApis.sendResponseCallback$1',2,0,0)
+f(25,10507,158,1,'kafka/server/RequestHandlerHelper.sendResponseMaybeThrottle')
+f(26,10510,136,1,'kafka/network/RequestChannel.sendResponse')
+f(27,10537,61,1,'kafka/network/RequestChannel.sendResponse')
+f(28,10540,58,1,'kafka/network/Processor.enqueueResponse',3,0,0)
+f(29,10543,55,1,'kafka/network/Processor.wakeup',3,0,0)
+f(30,10543,55,1,'org/apache/kafka/common/network/Selector.wakeup',3,0,0)
+f(31,10543,55,1,'sun/nio/ch/EPollSelectorImpl.wakeup',3,0,0)
+f(32,10543,55,1,'sun/nio/ch/EventFD.set',3,0,0)
+f(33,10545,53,1,'sun/nio/ch/EventFD.set0',1,0,0)
+f(34,10549,49,3,'write')
+f(35,10555,43,5,'entry_SYSCALL_64_after_hwframe')
+f(36,10555,43,5,'do_syscall_64')
+f(37,10555,40,5,'ksys_write')
+f(38,10556,39,5,'vfs_write')
+f(27,10606,40,1,'org/apache/kafka/common/requests/OffsetCommitResponse.errorCounts')
+f(28,10608,38,1,'org/apache/kafka/common/requests/AbstractResponse.errorCounts',2,0,0)
+f(29,10608,38,1,'java/util/stream/ReferencePipeline.collect',2,0,0)
+f(30,10608,38,1,'java/util/stream/AbstractPipeline.evaluate',2,0,0)
+f(12,10729,240,1,'kafka/server/ReplicaManager.appendToLocalLog',2,0,0)
+f(13,10731,238,1,'scala/collection/AbstractMap.map')
+f(14,10731,238,1,'scala/collection/MapOps.map$')
+f(15,10731,238,1,'scala/collection/MapOps.map')
+f(16,10731,238,1,'scala/collection/immutable/Map$.from')
+f(17,10731,238,1,'scala/collection/immutable/Map$.from',7,0,0)
+f(18,10732,237,1,'scala/collection/immutable/MapBuilderImpl.addAll',6,0,0)
+f(19,10732,237,1,'scala/collection/mutable/Growable.addAll$',6,0,0)
+f(20,10732,237,1,'scala/collection/mutable/Growable.addAll',6,0,0)
+f(21,10737,225,1,'scala/collection/Iterator$$anon$9.next')
+f(22,10738,223,1,'kafka/server/ReplicaManager$$Lambda$1537.0x000000080110b4f0.apply')
+f(23,10741,220,1,'kafka/server/ReplicaManager.$anonfun$appendToLocalLog$6')
+f(24,10741,201,1,'kafka/cluster/Partition.appendRecordsToLeader')
+f(25,10743,199,1,'kafka/cluster/Partition.$anonfun$appendRecordsToLeader$1',3,0,0)
+f(26,10758,184,1,'kafka/log/UnifiedLog.appendAsLeader',1,0,0)
+f(27,10759,183,1,'kafka/log/UnifiedLog.append')
+f(28,10765,107,1,'kafka/log/LocalLog.append')
+f(29,10766,106,1,'kafka/log/LogSegment.append')
+f(30,10777,94,1,'org/apache/kafka/common/record/FileRecords.append')
+f(31,10781,90,1,'org/apache/kafka/common/record/MemoryRecords.writeFullyTo')
+f(32,10781,90,1,'sun/nio/ch/FileChannelImpl.write')
+f(33,10782,85,1,'sun/nio/ch/IOUtil.write')
+f(34,10782,85,1,'sun/nio/ch/IOUtil.write')
+f(35,10787,78,1,'sun/nio/ch/IOUtil.writeFromNativeBuffer',2,0,0)
+f(36,10787,78,1,'sun/nio/ch/FileDispatcherImpl.write',2,0,0)
+f(37,10789,76,1,'sun/nio/ch/FileDispatcherImpl.write0')
+f(38,10790,75,3,'write')
+f(39,10795,70,5,'entry_SYSCALL_64_after_hwframe')
+f(40,10795,69,5,'do_syscall_64')
+f(41,10796,65,5,'ksys_write')
+f(42,10800,61,5,'vfs_write')
+f(43,10804,55,5,'new_sync_write')
+f(44,10805,54,5,'xfs_file_buffered_aio_write')
+f(4,11179,5788,1,'kafka/server/KafkaApis.handleProduceRequest',0,0,1)
+f(5,11205,5735,1,'kafka/server/ReplicaManager.appendRecords',2,1,0)
+f(6,11208,134,1,'kafka/server/DelayedOperationPurgatory.tryCompleteElseWatch')
+f(7,11208,134,1,'kafka/server/DelayedOperation.safeTryCompleteOrElse')
+f(8,11208,134,1,'kafka/server/DelayedProduce.tryComplete')
+f(9,11209,124,1,'kafka/server/DelayedOperation.forceComplete')
+f(10,11209,124,1,'kafka/server/DelayedProduce.onComplete')
+f(11,11211,120,1,'kafka/server/KafkaApis$$Lambda$1626.0x00000008011322e8.apply')
+f(12,11212,119,1,'kafka/server/KafkaApis.$anonfun$handleProduceRequest$9$adapted',1,0,0)
+f(13,11212,119,1,'kafka/server/KafkaApis.$anonfun$handleProduceRequest$9',1,0,0)
+f(14,11213,118,1,'kafka/server/KafkaApis.sendResponseCallback$2')
+f(15,11213,74,1,'kafka/network/RequestChannel.sendResponse')
+f(15,11287,42,1,'org/apache/kafka/common/requests/ProduceResponse.<init>',2,0,0)
+f(16,11287,42,1,'org/apache/kafka/common/requests/ProduceResponse.toData',2,0,0)
+f(17,11287,42,1,'java/util/Map.forEach',2,0,0)
+f(18,11287,37,1,'org/apache/kafka/common/requests/ProduceResponse$$Lambda$1693.0x0000000801153d88.accept')
+f(19,11287,37,1,'org/apache/kafka/common/requests/ProduceResponse.lambda$toData$1')
+f(6,11351,5544,1,'kafka/server/ReplicaManager.appendToLocalLog',1,0,0)
+f(7,11352,5543,1,'scala/collection/mutable/HashMap.map')
+f(8,11352,5543,1,'scala/collection/StrictOptimizedMapOps.map$')
+f(9,11352,5543,1,'scala/collection/StrictOptimizedMapOps.map')
+f(10,11353,5537,1,'kafka/server/ReplicaManager$$Lambda$1537.0x000000080110b4f0.apply')
+f(11,11353,5537,1,'kafka/server/ReplicaManager.$anonfun$appendToLocalLog$6')
+f(12,11361,5494,1,'kafka/cluster/Partition.appendRecordsToLeader')
+f(13,11368,5487,1,'kafka/cluster/Partition.$anonfun$appendRecordsToLeader$1',12,0,0)
+f(14,11384,5471,1,'kafka/log/UnifiedLog.appendAsLeader',2,0,0)
+f(15,11386,5469,1,'kafka/log/UnifiedLog.append')
+f(16,11398,4126,1,'kafka/log/LocalLog.append',6,0,0)
+f(17,11402,4119,1,'kafka/log/LogSegment.append',3,0,0)
+f(18,11452,4069,1,'org/apache/kafka/common/record/FileRecords.append')
+f(19,11456,4065,1,'org/apache/kafka/common/record/MemoryRecords.writeFullyTo')
+f(20,11456,4065,1,'sun/nio/ch/FileChannelImpl.write')
+f(21,11456,4055,1,'sun/nio/ch/IOUtil.write',1,0,0)
+f(22,11457,4054,1,'sun/nio/ch/IOUtil.write')
+f(23,11460,4045,1,'sun/nio/ch/IOUtil.writeFromNativeBuffer',948,0,0)
+f(24,11460,4045,1,'sun/nio/ch/FileDispatcherImpl.write',948,0,0)
+f(25,11462,945,3,'jbyte_disjoint_arraycopy')
+f(26,12319,87,5,'asm_common_interrupt')
+f(27,12319,87,5,'common_interrupt')
+f(28,12319,87,5,'irq_exit_rcu')
+f(29,12319,87,5,'do_softirq_own_stack')
+f(30,12319,87,5,'asm_call_sysvec_on_stack')
+f(31,12319,87,5,'__softirqentry_text_start')
+f(32,12342,64,5,'net_rx_action')
+f(33,12342,64,5,'napi_poll')
+f(34,12342,64,5,'ena_io_poll?[ena]')
+f(25,12408,3097,1,'sun/nio/ch/FileDispatcherImpl.write0')
+f(26,12415,3090,3,'write')
+f(27,12421,3084,5,'entry_SYSCALL_64_after_hwframe')
+f(28,12421,3082,5,'do_syscall_64')
+f(29,12421,3076,5,'ksys_write')
+f(30,12429,3068,5,'vfs_write')
+f(31,12435,3060,5,'new_sync_write')
+f(32,12435,3059,5,'xfs_file_buffered_aio_write')
+f(33,12438,3007,5,'iomap_file_buffered_write')
+f(34,12438,3007,5,'iomap_apply')
+f(35,12439,2998,5,'iomap_write_actor')
+f(36,12481,984,5,'iomap_write_begin')
+f(37,12506,52,5,'__iomap_write_begin')
+f(37,12560,905,5,'grab_cache_page_write_begin')
+f(38,12563,894,5,'pagecache_get_page')
+f(39,12573,282,5,'__alloc_pages_nodemask')
+f(40,12595,260,5,'get_page_from_freelist')
+f(41,12620,46,5,'node_dirty_ok')
+f(41,12671,184,5,'rmqueue')
+f(42,12677,178,5,'rmqueue_pcplist.constprop.0')
+f(39,12855,536,5,'add_to_page_cache_lru')
+f(40,12863,281,5,'__add_to_page_cache_locked')
+f(41,13057,55,5,'mem_cgroup_charge')
+f(40,13144,247,5,'lru_cache_add')
+f(41,13157,234,5,'pagevec_lru_move_fn')
+f(42,13163,209,5,'_raw_spin_unlock_irqrestore')
+f(39,13403,54,5,'find_get_entry')
+f(40,13412,45,5,'xas_load')
+f(36,13465,511,5,'iomap_write_end')
+f(37,13495,217,5,'iomap_set_page_dirty')
+f(38,13533,156,5,'_raw_spin_unlock_irqrestore')
+f(37,13712,254,5,'iomap_set_range_uptodate')
+f(36,13986,1250,5,'iov_iter_copy_from_user_atomic')
+f(37,14019,1217,5,'copy_user_enhanced_fast_string')
+f(38,15141,90,5,'asm_common_interrupt')
+f(39,15141,90,5,'common_interrupt')
+f(40,15141,90,5,'irq_exit_rcu')
+f(41,15141,90,5,'do_softirq_own_stack')
+f(42,15141,90,5,'asm_call_sysvec_on_stack')
+f(43,15141,90,5,'__softirqentry_text_start')
+f(44,15165,66,5,'net_rx_action')
+f(45,15166,65,5,'napi_poll')
+f(46,15168,63,5,'ena_io_poll?[ena]')
+f(47,15188,43,5,'napi_complete_done')
+f(48,15189,42,5,'netif_receive_skb_list_internal')
+f(49,15189,40,5,'__netif_receive_skb_list')
+f(50,15189,40,5,'__netif_receive_skb_list_core')
+f(51,15189,40,5,'ip_list_rcv')
+f(52,15189,40,5,'ip_list_rcv_finish.constprop.0')
+f(53,15189,40,5,'ip_sublist_rcv_finish')
+f(54,15189,40,5,'ip_local_deliver_finish')
+f(55,15189,40,5,'ip_protocol_deliver_rcu')
+f(56,15189,40,5,'tcp_v4_rcv')
+f(57,15190,38,5,'tcp_v4_do_rcv')
+f(58,15190,38,5,'tcp_rcv_established')
+f(36,15236,201,5,'iov_iter_fault_in_readable')
+f(37,15251,185,5,'__get_user_nocheck_1')
+f(33,15445,47,5,'xfs_file_aio_write_checks')
+f(34,15446,46,5,'file_update_time')
+f(35,15449,43,5,'xfs_vn_update_time')
+f(16,15524,563,1,'kafka/log/LogValidator$.validateMessagesAndAssignOffsets')
+f(17,15524,561,1,'kafka/log/LogValidator$.assignOffsetsNonCompressed',16,0,0)
+f(18,15524,557,1,'java/lang/Iterable.forEach',13,0,0)
+f(19,15524,557,1,'kafka/log/LogValidator$$$Lambda$1541.0x0000000801115a78.accept',13,0,0)
+f(20,15524,557,1,'kafka/log/LogValidator$.$anonfun$assignOffsetsNonCompressed$1',13,0,0)
+f(21,15524,554,1,'java/lang/Iterable.forEach',12,0,0)
+f(22,15536,119,1,'kafka/log/LogValidator$$$Lambda$1542.0x0000000801115cb0.accept')
+f(23,15545,110,2,'kafka/log/LogValidator$.$anonfun$assignOffsetsNonCompressed$2',110,0,0)
+f(24,15545,110,2,'kafka/log/LogValidator$.validateRecord',110,0,0)
+f(25,15545,110,2,'kafka/log/LogValidator$.validateKey',110,0,0)
+f(22,15683,394,1,'org/apache/kafka/common/record/DefaultRecordBatch$RecordIterator.next')
+f(23,15696,381,1,'org/apache/kafka/common/record/DefaultRecordBatch$RecordIterator.next',87,0,0)
+f(24,15703,374,1,'org/apache/kafka/common/record/DefaultRecordBatch$3.readNext',80,0,0)
+f(25,15703,374,1,'org/apache/kafka/common/record/DefaultRecord.readFrom',80,0,0)
+f(26,15783,294,1,'org/apache/kafka/common/record/DefaultRecord.readFrom')
+f(16,16087,59,1,'kafka/log/UnifiedLog.analyzeAndValidateProducerState',2,0,0)
+f(17,16087,58,1,'java/lang/Iterable.forEach',2,0,0)
+f(18,16089,56,1,'kafka/log/UnifiedLog$$Lambda$1548.0x0000000801113c00.accept')
+f(19,16092,53,2,'kafka/log/UnifiedLog.$anonfun$analyzeAndValidateProducerState$1',23,0,0)
+f(16,16146,635,1,'kafka/log/UnifiedLog.analyzeAndValidateRecords')
+f(17,16147,632,1,'java/lang/Iterable.forEach',3,0,0)
+f(18,16149,627,1,'kafka/log/UnifiedLog$$Lambda$1538.0x000000080110bb68.accept',1,0,0)
+f(19,16150,626,1,'kafka/log/UnifiedLog.$anonfun$analyzeAndValidateRecords$1')
+f(20,16157,619,3,'updateBytesCRC32C')
+f(21,16716,56,5,'asm_common_interrupt')
+f(22,16716,56,5,'common_interrupt')
+f(23,16716,56,5,'irq_exit_rcu')
+f(24,16716,56,5,'do_softirq_own_stack')
+f(25,16716,56,5,'asm_call_sysvec_on_stack')
+f(26,16716,56,5,'__softirqentry_text_start')
+f(27,16725,46,5,'net_rx_action')
+f(28,16725,46,5,'napi_poll')
+f(29,16725,46,5,'ena_io_poll?[ena]')
+f(16,16815,40,1,'scala/collection/AbstractIterable.foreach')
+f(17,16815,40,1,'scala/collection/IterableOnceOps.foreach$')
+f(18,16815,40,1,'scala/collection/IterableOnceOps.foreach')
+f(4,16968,656,1,'kafka/server/ReplicaManager.tryCompleteActions',2,0,0)
+f(5,16970,654,1,'kafka/server/ActionQueue.tryCompleteActions')
+f(6,16978,646,1,'kafka/server/ReplicaManager$$Lambda$1560.0x000000080111fa60.apply$mcV$sp',5,0,0)
+f(7,16978,646,1,'kafka/server/ReplicaManager.$anonfun$appendRecords$5',5,0,0)
+f(8,16994,630,1,'scala/collection/mutable/HashMap.foreach',2,0,0)
+f(9,16994,630,1,'scala/collection/mutable/HashMap$Node.foreach',2,0,0)
+f(10,16994,630,1,'kafka/server/ReplicaManager$$Lambda$1575.0x0000000801122b90.apply',2,0,0)
+f(11,16994,630,1,'kafka/server/ReplicaManager.$anonfun$appendRecords$6',2,0,0)
+f(12,16996,628,1,'kafka/server/DelayedOperationPurgatory.checkAndComplete')
+f(13,16996,601,1,'kafka/server/DelayedOperationPurgatory$Watchers.tryCompleteWatched',47,0,0)
+f(14,17034,554,1,'kafka/server/DelayedOperation.safeTryComplete')
+f(15,17034,554,1,'kafka/server/DelayedFetch.tryComplete')
+f(16,17037,429,1,'kafka/server/DelayedOperation.forceComplete',3,0,0)
+f(17,17037,426,1,'kafka/server/DelayedFetch.onComplete')
+f(18,17038,180,1,'kafka/server/KafkaApis$$Lambda$1653.0x000000080113a6c0.apply')
+f(19,17038,180,1,'kafka/server/KafkaApis.$anonfun$handleFetchRequest$33$adapted')
+f(20,17038,180,1,'kafka/server/KafkaApis.$anonfun$handleFetchRequest$33')
+f(21,17038,180,1,'kafka/server/KafkaApis.processResponseCallback$1')
+f(22,17059,68,1,'kafka/network/RequestChannel.sendResponse')
+f(22,17159,40,1,'kafka/server/IncrementalFetchContext.updateAndGenerateResponseData')
+f(18,17218,193,1,'kafka/server/ReplicaManager.readFromLocalLog')
+f(19,17218,192,1,'scala/collection/AbstractIterable.foreach',3,0,0)
+f(20,17218,192,1,'scala/collection/IterableOnceOps.foreach$',3,0,0)
+f(21,17218,192,1,'scala/collection/IterableOnceOps.foreach',3,0,0)
+f(22,17221,187,1,'kafka/server/ReplicaManager$$Lambda$1655.0x000000080113b230.apply')
+f(23,17221,187,1,'kafka/server/ReplicaManager.$anonfun$readFromLocalLog$7')
+f(24,17223,177,1,'kafka/server/ReplicaManager.read$1')
+f(25,17233,147,1,'kafka/cluster/Partition.fetchRecords',14,0,0)
+f(26,17247,133,1,'kafka/cluster/Partition.$anonfun$fetchRecords$2')
+f(27,17251,129,1,'kafka/cluster/Partition.readFromLocalLog$1',10,0,0)
+f(28,17251,129,1,'kafka/cluster/Partition.readRecords',10,0,0)
+f(29,17251,129,1,'kafka/log/UnifiedLog.read',10,0,0)
+f(30,17251,129,1,'kafka/log/LocalLog.read',10,0,0)
+f(31,17251,119,1,'kafka/log/LocalLog.$anonfun$read$2')
+f(32,17264,74,1,'kafka/log/LogSegment.read',1,0,0)
+f(33,17264,74,1,'kafka/log/LogSegment.translateOffset',1,0,0)
+f(34,17275,63,1,'org/apache/kafka/common/record/FileRecords.searchForOffsetWithSize')
+f(35,17286,52,1,'org/apache/kafka/common/utils/AbstractIterator.hasNext')
+f(36,17287,51,1,'org/apache/kafka/common/utils/AbstractIterator.maybeComputeNext',1,0,0)
+f(37,17287,50,1,'org/apache/kafka/common/record/RecordBatchIterator.makeNext')
+f(38,17287,50,1,'org/apache/kafka/common/record/RecordBatchIterator.makeNext')
+f(39,17287,50,1,'org/apache/kafka/common/record/FileLogInputStream.nextBatch')
+f(40,17287,50,1,'org/apache/kafka/common/record/FileLogInputStream.nextBatch')
+f(41,17287,50,1,'org/apache/kafka/common/utils/Utils.readFullyOrFail',1,0,0)
+f(42,17287,50,1,'org/apache/kafka/common/utils/Utils.readFully',1,0,0)
+f(43,17287,50,1,'sun/nio/ch/FileChannelImpl.read',1,0,0)
+f(44,17288,49,1,'sun/nio/ch/FileChannelImpl.readInternal')
+f(45,17289,46,1,'sun/nio/ch/IOUtil.read')
+f(46,17289,46,1,'sun/nio/ch/IOUtil.read')
+f(47,17295,38,1,'sun/nio/ch/IOUtil.readIntoNativeBuffer',1,0,0)
+f(48,17295,38,1,'sun/nio/ch/FileDispatcherImpl.pread',1,0,0)
+f(49,17296,37,1,'sun/nio/ch/FileDispatcherImpl.pread0')
+f(18,17411,52,1,'scala/collection/mutable/ArrayBuffer.map',1,0,0)
+f(19,17411,52,1,'scala/collection/StrictOptimizedIterableOps.map$',15,0,0)
+f(20,17411,52,1,'scala/collection/StrictOptimizedIterableOps.map',15,0,0)
+f(16,17466,122,1,'scala/collection/AbstractIterable.foreach',6,0,0)
+f(17,17466,122,1,'scala/collection/IterableOnceOps.foreach$',6,0,0)
+f(18,17466,122,1,'scala/collection/IterableOnceOps.foreach',6,0,0)
+f(19,17467,119,1,'kafka/server/DelayedFetch$$Lambda$1685.0x00000008011571d8.apply',6,0,0)
+f(20,17469,117,1,'kafka/server/DelayedFetch.$anonfun$tryComplete$1$adapted',4,0,0)
+f(21,17473,113,1,'kafka/server/DelayedFetch.$anonfun$tryComplete$1')
+f(22,17503,60,1,'kafka/cluster/Partition.fetchOffsetSnapshot')
+f(1,17648,1231,3,'start_thread')
+f(2,17648,1231,3,'thread_native_entry(Thread*)')
+f(3,17648,1231,4,'Thread::call_run()')
+f(4,17648,247,4,'ConcurrentGCThread::run()')
+f(5,17650,244,4,'G1ConcurrentRefineThread::run_service()')
+f(6,17650,244,4,'G1DirtyCardQueueSet::refine_completed_buffer_concurrently(unsigned int, unsigned long, G1ConcurrentRefineStats*)')
+f(7,17650,244,4,'G1DirtyCardQueueSet::refine_buffer(BufferNode*, unsigned int, G1ConcurrentRefineStats*)')
+f(8,17666,208,4,'G1RemSet::refine_card_concurrently(unsigned char*, unsigned int)')
+f(9,17750,124,4,'void OopOopIterateDispatch<G1ConcurrentRefineOopClosure>::Table::oop_oop_iterate<InstanceKlass, narrowOop>(G1ConcurrentRefineOopClosure*, oopDesc*, Klass*)')
+f(4,17895,688,4,'GangWorker::run()')
+f(5,17895,688,4,'GangWorker::loop()')
+f(6,17908,138,4,'G1ClearBitMapTask::work(unsigned int)')
+f(7,17908,138,4,'HeapRegionManager::par_iterate(HeapRegionClosure*, HeapRegionClaimer*, unsigned int) const')
+f(8,17923,123,4,'G1ClearBitMapTask::G1ClearBitmapHRClosure::do_heap_region(HeapRegion*)')
+f(9,17926,120,4,'MarkBitMap::do_clear(MemRegion, bool)')
+f(10,17927,119,3,'__memset_avx2_erms')
+f(6,18046,513,4,'G1EvacuateRegionsBaseTask::work(unsigned int)')
+f(7,18054,503,4,'G1EvacuateRegionsTask::scan_roots(G1ParScanThreadState*, unsigned int)')
+f(8,18054,484,4,'G1RemSet::scan_heap_roots(G1ParScanThreadState*, unsigned int, G1GCPhaseTimes::GCParPhases, G1GCPhaseTimes::GCParPhases, bool)')
+f(9,18055,472,4,'G1ScanHRForRegionClosure::scan_heap_roots(HeapRegion*)')
+f(10,18148,229,4,'G1ParScanThreadState::trim_queue_to_threshold(unsigned int)')
+f(11,18320,56,4,'void OopOopIterateBackwardsDispatch<G1ScanEvacuatedObjClosure>::Table::oop_oop_iterate_backwards<InstanceKlass, narrowOop>(G1ScanEvacuatedObjClosure*, oopDesc*, Klass*)')
+f(12,18332,44,4,'void G1ScanEvacuatedObjClosure::do_oop_work<narrowOop>(narrowOop*)')
+f(10,18413,112,4,'void OopOopIterateDispatch<G1ScanCardClosure>::Table::oop_oop_iterate<InstanceKlass, narrowOop>(G1ScanCardClosure*, oopDesc*, Klass*)')
+f(11,18468,57,4,'void G1ScanCardClosure::do_oop_work<narrowOop>(narrowOop*)')
+f(4,18583,281,4,'JavaThread::run()')
+f(5,18583,275,4,'CompileBroker::compiler_thread_loop()')
+f(6,18583,275,4,'CompileBroker::invoke_compiler_on_method(CompileTask*)')
+f(7,18583,262,4,'C2Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*)')
+f(8,18583,262,4,'Compile::Compile(ciEnv*, ciMethod*, int, bool, bool, bool, bool, bool, DirectiveSet*)')
+f(9,18583,146,4,'Compile::Code_Gen()')
+f(10,18613,103,4,'PhaseChaitin::Register_Allocate()')
+f(9,18729,82,4,'Compile::Optimize()')
+f(10,18742,44,4,'PhaseIdealLoop::optimize(PhaseIterGVN&, LoopOptsMode)')
+f(11,18742,42,4,'PhaseIdealLoop::build_and_optimize()')
+
+search();
+</script></body></html>
